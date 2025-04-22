@@ -1,0 +1,332 @@
+# System and Environment Optimization
+options(matprod = "blas")
+RNGkind("L'Ecuyer-CMRG")
+options(stringsAsFactors = FALSE)
+options(scipen = 999)
+
+prepare_env <- function() {
+  gc(full = TRUE, verbose = FALSE)
+  
+  cores <- parallel::detectCores() - 1
+  
+  # Load data.table before using its functions
+  if (!require("data.table")) {
+    install.packages("data.table")
+    library(data.table)
+  }
+  
+  # Cross-platform optimizations
+  Sys.setenv(OMP_NUM_THREADS = cores)
+  Sys.setenv(OPENBLAS_NUM_THREADS = cores)
+  data.table::setDTthreads(threads = cores)  # Explicitly use data.table namespace
+  
+  options(matprod = "blas",
+          digits.secs = 3,
+          na.action = "na.omit", 
+          stringsAsFactors = FALSE,
+          scipen = 999)
+}
+
+optimize_data <- function(file_path) {
+ DT <- fread(file_path,
+             nThread = parallel::detectCores() - 1,
+             integer64 = "numeric",
+             data.table = TRUE,
+             na.strings = NULL)
+ 
+ if("MSA.VAR" %in% names(DT)) setkey(DT, MSA.VAR) 
+ if("PT.VAR" %in% names(DT)) setorderv(DT, "PT.VAR")
+ 
+ return(as.data.frame(DT))
+}
+
+moodyResearch = function(MAIN.DIR, INPUT.FILE, Y.VAR, VARS, K.FOLDS, MIN.MSA, PT.VAR, MSA.VAR, ID.VAR,
+                        SPREAD.VAR, MIN.WEIGHT, MAX.WEIGHT, INC.WEIGHT, MIN.NN, MAX.NN, INC.NN, Q.RANGE,
+                        MARKET_SUBMARKET_VAR = "Market_Submarket_ID",
+                        MARKET_VAR = "REIS_Market_ID",
+                        REGION_VAR = "region_code") {
+  
+  # Environment preparation
+  prepare_env()
+  
+  if(MIN.NN == 0) { 
+    print("Error: cannot have minimum neighbors (MIN.NN) of 0.")
+    stop() 
+  }
+  
+  # Package management
+  dir.create("/home/troy/R/aarch64-amazon-linux-gnu-library/4.3/library", recursive = TRUE, showWarnings = FALSE)
+  .libPaths("/home/troy/R/aarch64-amazon-linux-gnu-library/4.3/library")
+  list.of.packages = c("data.table","RANN","foreach","doSNOW","stats","parallel", "Rmpfr")
+  new.packages = list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+  if(length(new.packages) > 0) install.packages(new.packages)
+  lapply(list.of.packages, require, character.only = TRUE)
+
+  # Load and optimize data
+  comparables = optimize_data(paste0(MAIN.DIR,"DATA/",INPUT.FILE,".csv"))
+  
+  # Validate variables
+  test.names = c(Y.VAR, VARS, PT.VAR, SPREAD.VAR)
+  found.names = !(test.names %in% colnames(comparables))
+  if(sum(found.names) > 0) {
+    print(paste0("Error: cannot find variables: ", test.names[!(test.names %in% colnames(comparables))]))
+    stop()
+  }
+  
+  # Calculate spread
+  comparables$SPREAD = comparables[,Y.VAR] - comparables[,SPREAD.VAR]
+  
+  # Process property types
+  my.pt = sort(unique(comparables[,PT.VAR]))
+  
+  # Generate weights matrix
+  N = length(VARS)
+  vec = c(seq(MIN.WEIGHT, MAX.WEIGHT, INC.WEIGHT))
+  lst = lapply(numeric(N), function(x) vec)
+  mW = as.matrix(expand.grid(lst))
+  mW = mW[2:nrow(mW),]
+  mW = as.data.frame(mW)
+  colnames(mW) = VARS
+  
+  # Generate neighbors sequence
+  NN.vec = seq(MIN.NN, MAX.NN, INC.NN)
+  
+  # Initialize results containers
+  pt.resids = vector("list", length(my.pt))
+  mape.vec = vector("list", length(my.pt))
+  RESULTS = vector("list", length(my.pt))
+  
+  for(ii in 1:length(my.pt)) {
+    mape.vec[[ii]] = 9999
+  }
+  
+  # Main property type loop
+  for(ii in 1:length(my.pt)) {
+    # Subset data
+    pt.kNN = subset(comparables, get(PT.VAR) == my.pt[ii])
+    
+    # Create fold indices
+    seq.idx = floor(nrow(pt.kNN)/K.FOLDS)
+    seq.idx = rep(seq(1,K.FOLDS), seq.idx)
+    length(seq.idx) = nrow(pt.kNN)
+    seq.idx[is.na(seq.idx)] = K.FOLDS
+    pt.kNN$seq.idx = seq.idx
+    
+    # Count occurrences function - modified to handle 'NA' string correctly
+count_levels <- function(data, colname) {
+    if (colname %in% colnames(data)) {
+        # Only treat empty strings as NA, not 'NA' in names like NAshville
+        valid_data <- ifelse(data[[colname]] == "", NA, data[[colname]])
+        return(ave(rep(1, nrow(data)), valid_data, FUN = length))
+    }
+    return(rep(NA, nrow(data)))
+}
+
+
+# Function to compute and apply spreads hierarchically
+apply_spread <- function(data, level_var, level_count, min_count, source_label, final_col) {
+    if (level_var %in% colnames(data)) {
+        # Only process non-empty strings and rows where spread hasn't been set
+        valid_idx <- data[[level_var]] != "" & 
+                    is.na(data$msa_spread) & 
+                    data[[level_count]] >= min_count
+        
+        if (any(valid_idx)) {
+            tryCatch({
+                level_spreads <- aggregate(
+                    data$SPREAD[valid_idx], 
+                    by = list(data[[level_var]][valid_idx]), 
+                    FUN = mean, 
+                    na.rm = TRUE
+                )
+                colnames(level_spreads) <- c(level_var, "mean_spread")
+                
+                data <- merge(data, level_spreads, by = level_var, all.x = TRUE)
+                
+                # Apply spreads where appropriate, keeping empty strings empty in final columns
+                na_idx <- is.na(data$msa_spread) & !is.na(data$mean_spread)
+                data$msa_spread[na_idx] <- data$mean_spread[na_idx]
+                data$spread_source[na_idx] <- source_label
+                data[[final_col]][na_idx] <- data[[level_var]][na_idx]
+                
+                data$mean_spread <- NULL
+                
+            }, error = function(e) {
+                warning(paste("Error processing level:", level_var, "\n", e$message))
+            })
+        }
+    }
+    return(data)
+}
+
+# Initialize columns - initialize final columns as empty strings instead of NA
+pt.kNN$msa_spread <- NA_real_
+pt.kNN$spread_source <- NA_character_
+pt.kNN$final_submarket <- ""
+pt.kNN$final_market <- ""
+pt.kNN$final_region <- ""
+pt.kNN$final_msa <- ""
+
+# Calculate counts for each level
+pt.kNN$submarket_count <- count_levels(pt.kNN, MARKET_SUBMARKET_VAR)
+pt.kNN$market_count <- count_levels(pt.kNN, MARKET_VAR)
+pt.kNN$region_count <- count_levels(pt.kNN, REGION_VAR)
+pt.kNN$msa_count <- count_levels(pt.kNN, MSA.VAR)
+
+# Apply spreads in hierarchical order
+pt.kNN <- apply_spread(pt.kNN, MARKET_SUBMARKET_VAR, "submarket_count", MIN.MSA, "submarket", "final_submarket")
+pt.kNN <- apply_spread(pt.kNN, MARKET_VAR, "market_count", MIN.MSA, "market", "final_market")
+pt.kNN <- apply_spread(pt.kNN, REGION_VAR, "region_count", MIN.MSA, "region", "final_region")
+pt.kNN <- apply_spread(pt.kNN, MSA.VAR, "msa_count", 0, "msa", "final_msa")  # No min threshold for MSA
+
+# Calculate IDSPREAD
+pt.kNN$IDSPREAD <- pt.kNN$SPREAD - pt.kNN$msa_spread
+
+    # Setup parallel processing
+    cores =  max(detectCores() - 6)
+    cl = makeSOCKcluster(cores)
+    registerDoSNOW(cl)
+    
+    pb = txtProgressBar(min=1, max=nrow(mW), style=3)
+    progress = function(n) setTxtProgressBar(pb, n)
+    opts = list(progress = progress)
+    
+    MAPE.NN = foreach(ww = 1:nrow(mW),
+                     .packages = c("RANN","stats"),
+                     .options.snow = opts,
+                     .combine = 'rbind',
+                     .errorhandling = "pass") %dopar% {
+      
+      w = mW[ww,]
+      results_matrix = matrix(NA, nrow = length(NN.vec), ncol = 2 + length(w))
+      
+      for(nn in 1:length(NN.vec)) {
+        NN = NN.vec[nn]
+        fold_results = vector("list", K.FOLDS)
+        
+        for(kk in 1:K.FOLDS) {
+          test.data = subset(pt.kNN, seq.idx == kk)
+          train.data = subset(pt.kNN, seq.idx != kk)
+          
+          mean.train = colMeans(train.data[,VARS])
+          sd.train = apply(train.data[,VARS], 2, sd)
+          
+          train.kNN = scale(train.data[,VARS])
+          test.kNN = scale(test.data[,VARS], center=mean.train, scale=sd.train)
+          
+          train.kNN = sweep(train.kNN, 2, as.numeric(w), "*")
+          test.kNN = sweep(test.kNN, 2, as.numeric(w), "*")
+          
+          my.knn = nn2(train.kNN, test.kNN, k = NN)
+          my.id = my.knn$nn.idx
+          my.dist = my.knn$nn.dists
+          
+          max_dist = apply(my.dist, 1, max)
+          w.id = t(apply(my.dist, 1, function(d) {
+            weights = (1 - (d/(max(d) + .Machine$double.eps))^3)^3
+            weights[is.na(weights)] = 0.001
+            weights
+          }))
+          
+          predicted = sapply(1:nrow(test.kNN), function(i) {
+            comps = train.data$IDSPREAD[my.id[i,]]
+            weighted.mean(comps, w.id[i,], na.rm = TRUE)
+          })
+          
+          predicted = predicted + test.data[,SPREAD.VAR] + test.data$msa_spread
+          
+          test.data$predicted = predicted
+          test.data$mape = abs(test.data[,Y.VAR] - test.data$predicted)
+          fold_results[[kk]] = test.data[,c(Y.VAR, "predicted", "mape", ID.VAR, 
+                                 "spread_source", "msa_spread", 
+                                 "final_submarket", "final_market", "final_region", "final_msa",
+                                 "submarket_count", "market_count", "region_count", "msa_count"
+)]
+        }
+        
+        MAPE.fold = do.call(rbind, fold_results)
+        MAPE = mean(MAPE.fold$mape, na.rm = TRUE)
+        results_matrix[nn,] = c(MAPE, NN, as.numeric(w))
+      }
+      
+      results_df = as.data.frame(results_matrix)
+      colnames(results_df) = c("MAPE","NN",colnames(w))
+      results_df
+    }
+    
+    close(pb)
+    stopCluster(cl)
+    
+    # Process results
+    MAPE.NN = MAPE.NN[complete.cases(MAPE.NN), ]
+    min.mape = which(MAPE.NN$MAPE == min(MAPE.NN$MAPE))[1]
+    best.w = as.numeric(MAPE.NN[min.mape, 3:(3+length(VARS)-1)])
+    best.NN = MAPE.NN[min.mape, "NN"]
+    
+    # Recalculate best fold
+    best.MAPE.fold = NULL
+    for(kk in 1:K.FOLDS) {
+      test.data = subset(pt.kNN, seq.idx == kk)
+      train.data = subset(pt.kNN, seq.idx != kk)
+      
+      mean.train = colMeans(train.data[,VARS])
+      sd.train = apply(train.data[,VARS], 2, sd)
+      
+      train.kNN = scale(train.data[,VARS])
+      test.kNN = scale(test.data[,VARS], center=mean.train, scale=sd.train)
+      
+      train.kNN = sweep(train.kNN, 2, best.w, "*")
+      test.kNN = sweep(test.kNN, 2, best.w, "*")
+      
+      my.knn = nn2(train.kNN, test.kNN, k = best.NN)
+      my.id = my.knn$nn.idx
+      my.dist = my.knn$nn.dists
+      
+      max_dist = apply(my.dist, 1, max)
+      w.id = t(apply(my.dist, 1, function(d) {
+        weights = (1 - (d/(max(d) + .Machine$double.eps))^3)^3
+        weights[is.na(weights)] = 0.001
+        weights
+      }))
+      
+      predicted = sapply(1:nrow(test.kNN), function(i) {
+        comps = train.data$IDSPREAD[my.id[i,]]
+        weighted.mean(comps, w.id[i,], na.rm = TRUE)
+      })
+      
+      predicted = predicted + test.data[,SPREAD.VAR] + test.data$msa_spread
+      
+      test.data$predicted = predicted
+      test.data$mape = abs(test.data[,Y.VAR] - test.data$predicted)
+      MAPE.sub = test.data[,c(Y.VAR, "predicted", "mape", ID.VAR, 
+                                 "spread_source", "msa_spread", 
+                                 "final_submarket", "final_market", "final_region", "final_msa",
+                                 "submarket_count", "market_count", "region_count", "msa_count")]
+      best.MAPE.fold = rbind.data.frame(best.MAPE.fold, MAPE.sub)
+    }
+    
+    if(mape.vec[[ii]] > MAPE.NN[min.mape, "MAPE"]) {
+      mape.vec[[ii]] = MAPE.NN[min.mape, "MAPE"]
+      pt.resids[[ii]] = best.MAPE.fold
+    }
+    
+    pt.mape = as.data.frame(MAPE.NN[min.mape,])
+    pt.mape$pt = my.pt[ii]
+       
+    RESULTS[[ii]] = list(pt.mape, pt.resids[[ii]])
+  }
+  
+  # Combine final results
+  est.Wght = vector("list", length(RESULTS))
+  est.Res = vector("list", length(RESULTS))
+  for(ii in 1:length(RESULTS)) {
+    est.Wght[[ii]] = RESULTS[[ii]][[1]]
+    est.Res[[ii]] = RESULTS[[ii]][[2]]
+  }
+  
+  RESULTS = do.call("rbind", est.Wght)
+  RESIDS = do.call("rbind", est.Res)
+  write.csv(RESIDS, file = paste0(MAIN.DIR,"RESIDUALS/residuals_",Sys.Date(),".csv"))
+  
+  return(RESULTS)
+}
